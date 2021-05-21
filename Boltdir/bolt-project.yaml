@@ -1,0 +1,6 @@
+---
+name: bolt_haproxy
+modules:
+- name: puppetlabs-haproxy
+- name: puppetlabs-concat
+- name: puppetlabs-stdlib

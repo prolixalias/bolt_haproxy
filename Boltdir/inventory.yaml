@@ -1,0 +1,12 @@
+---
+config:
+  ssh:
+    private-key: "~/.ssh/id_rsa"
+    host-key-check: false
+    run-as: root
+
+groups:
+  - name: haproxy
+    targets:
+      - name: proxy
+        uri: 192.168.1.42
