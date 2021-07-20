@@ -1,52 +1,95 @@
 plan bolt_haproxy::provision(
   TargetSpec $targets,
-  String $artifactory_ip,
-  String $artifactory_path,
-  String $single_path,
+  TargetSpec $backend_servers,
 ) {
+  apply_prep([$targets, $backend_servers])
 
-  $targets.apply_prep
+  $backends = get_targets($backend_servers)
+  $server_names = $backends.map |$t| { $t.host }
+  $ipaddresses = $backends.map |$t| { $t.facts['networking']['ip'] }
+  out::message("Load balancing across ${server_names} (${ipaddresses})")
 
-  # Apply code
   $apply_results = apply($targets) {
-
-    include haproxy
-
-    selboolean { 'haproxy_connect_any':
-      persistent => true,
-      value      => 'on',
+    # Sometimes need to `yum reinstall selinux-policy` for this to work
+    selinux::boolean { 'haproxy_connect_any': }
+    -> class { 'haproxy':
+      global_options   => {},
+      defaults_options => {
+        'timeout' => [
+          'client  60s',
+          'server  60s',
+          'connect 60s',
+          'tunnel 300s',
+        ],
+      },
+      merge_options    => false,
     }
 
-    haproxy::frontend { 'http':
-      bind    => {"${facts['ipaddress']}:80" => []},
-      mode    => 'http',
-      options => {
-        'reqadd'      => 'X-Forwarded-Proto:\ http',
-        'acl'         => "ACL_artifactory hdr(host) -i ${facts['fqdn']}",
-        'use_backend' => 'artifactory_http if ACL_artifactory',
+    Haproxy::Listen {
+      collect_exported => false,
+    }
+
+    # Sets up a status UI on port 8080
+    haproxy::listen { 'stats':
+      ipaddress => '*',
+      ports     => '8080',
+      mode      => 'http',
+      options   => {
+        'stats' => [
+          'enable',
+          'uri /',
+          'hide-version',
+        ],
       },
     }
 
-    haproxy::backend { 'artifactory_http':
-      mode    => 'http',
-      options => [
-        {'server' => "artifactory ${artifactory_ip}:443 check ssl verify none"},
-        {'reqrep' => "^([^\\ :]*)\\ ${single_path}[/]?(.*) \\1\\ ${artifactory_path}\\2"},
-      ],
+    Haproxy::Frontend {
+      ipaddress => '*',
+      mode      => 'tcp',
     }
 
-    haproxy::backend { 'default':
-      mode    => 'http',
-      options => {'server' => 'localhost 127.0.0.1:80'},
-    }
+    $services = {'app' => ['80', '443'], 'kubeapi' => '6443', 'webhook' => '8000', 'admin' => '8800'}
+    $services.each |String $service, Variant[String, Array[String]] $port| {
+      haproxy::frontend { $service:
+        ports   => $port,
+        options => {
+          'default_backend' => $service,
+        }
+      }
 
+      # An array of ports are treated as the same service, so only healthcheck one.
+      $extra_options = $port ? {
+        Array[String] => { 'tcp-check' => "connect port ${$port[0]}" },
+        default       => {},
+      }
+
+      haproxy::backend { $service:
+        options => {
+          'balance' => 'roundrobin',
+          'option'  => ['tcp-check'],
+        } + $extra_options
+      }
+
+      # An array of ports are load balanced to the same backends, but each port should map to the
+      # matching port on the backend. This is most easily accomplished by omitting them.
+      $member_port = $port ? {
+        Array[String] => undef,
+        default       => $port,
+      }
+
+      haproxy::balancermember { $service:
+        listening_service => $service,
+        ports             => $member_port,
+        server_names      => $server_names,
+        ipaddresses       => $ipaddresses,
+        options           => 'check',
+      }
+    }
   }
 
-  # Print log messages
   $apply_results.each |$result| {
     $result.report['logs'].each |$log| {
       out::message("${log['level'].upcase}: ${log['message']}")
     }
   }
-
 }
